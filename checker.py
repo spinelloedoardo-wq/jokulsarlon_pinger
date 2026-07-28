@@ -38,18 +38,28 @@ TARGET_YEAR  = 2026
 TARGET_MONTH = 8   # August
 TARGET_DAY   = 18
 
+# icelagoon.com Bokun credentials (known from page source)
+ICELAGOON_COM_CHANNEL_UUID = "50c3e856-1b67-4450-8dbb-aa6d2935644f"
+ICELAGOON_COM_PRODUCT_ID   = "14059"
+
 TOURS = [
     {
         "name": "Zodiac Boat Tour (icelagoon.is)",
         "url":  "https://icelagoon.is/tours/zodiac-boat-tour/",
+        "bokun_channel": None,  # discovered dynamically via Playwright
+        "bokun_product": None,
     },
     {
         "name": "Amphibian Tour (icelagoon.is)",
         "url":  "https://icelagoon.is/tours/amphibian-tours/",
+        "bokun_channel": None,
+        "bokun_product": None,
     },
     {
         "name": "Adventure Tour (icelagoon.com)",
         "url":  "https://www.icelagoon.com/adventure-tour/",
+        "bokun_channel": ICELAGOON_COM_CHANNEL_UUID,
+        "bokun_product": ICELAGOON_COM_PRODUCT_ID,
     },
 ]
 
@@ -61,6 +71,14 @@ UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+BOKUN_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Origin": "https://widgets.bokun.io",
+    "Referer": "https://widgets.bokun.io/",
+}
+
 # ── State ─────────────────────────────────────────────────────────────────────
 
 def load_state() -> dict:
@@ -71,7 +89,7 @@ def load_state() -> dict:
         except (json.JSONDecodeError, OSError):
             pass
     return {
-        "notified": [],      # list of tour names already notified as available
+        "notified": [],
         "last_check": None,
         "errors": 0,
     }
@@ -81,178 +99,228 @@ def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
-# ── Bokun availability check via Playwright ───────────────────────────────────
+# ── Direct Bokun API (for tours where we know channel+product) ────────────────
 
-def check_tour_availability(tour: dict) -> bool:
+def check_via_bokun_api(channel_uuid: str, product_id: str, tour_name: str) -> bool | None:
     """
-    Opens the tour page with Playwright, intercepts Bokun API calls,
-    and checks whether August 18 appears as available (not sold out).
+    Query Bokun's widget API directly for August 2026 availability.
+    Returns True=available, False=sold out, None=inconclusive (try Playwright fallback).
+    """
+    # Bokun widget availability endpoint (reverse-engineered from widget XHR)
+    endpoints = [
+        f"https://widgets.bokun.io/online-sales/{channel_uuid}/experience/{product_id}/availability?month=2026-08",
+        f"https://widgets.bokun.io/online-sales/{channel_uuid}/experience/{product_id}/calendar?year=2026&month=8",
+        f"https://widgets.bokun.io/api/v1/sell/experience/{product_id}/availabilities?startDate=2026-08-01&endDate=2026-08-31",
+    ]
 
-    Returns True if the date is available for booking.
+    for endpoint in endpoints:
+        try:
+            print(f"  Trying API: {endpoint}")
+            resp = requests.get(endpoint, headers=BOKUN_HEADERS, timeout=20)
+            print(f"  → HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                continue
+
+            data = resp.json()
+            print(f"  → Response keys: {list(data.keys()) if isinstance(data, dict) else 'list['+str(len(data))+']'}")
+
+            result = _parse_bokun_response_data(data, tour_name)
+            if result is not None:
+                return result
+
+        except Exception as e:
+            print(f"  API error: {e}")
+
+    return None  # inconclusive
+
+
+def _parse_bokun_response_data(data, tour_name: str) -> bool | None:
+    """Parse a Bokun API response. Returns True/False/None."""
+    items = data if isinstance(data, list) else (
+        data.get("days") or data.get("items") or data.get("availability") or
+        data.get("availabilities") or data.get("dates") or []
+    )
+
+    if not isinstance(items, list) or not items:
+        return None
+
+    print(f"  Parsing {len(items)} items...")
+    found_any = False
+
+    for item in items:
+        date_str = (
+            item.get("date") or item.get("startDate") or item.get("localDate") or
+            item.get("day") or item.get("startTime", "")
+        )
+        if not date_str:
+            continue
+
+        if not _is_target_date(str(date_str)):
+            continue
+
+        found_any = True
+        sold_out    = item.get("soldOut", False) or item.get("isSoldOut", False)
+        available   = item.get("available", True)
+        unavailable = item.get("unavailable", False)
+        closed      = item.get("closed", False)
+        status      = item.get("status", "")
+
+        print(f"  Aug 18 found: soldOut={sold_out}, available={available}, status={status}")
+
+        if sold_out or unavailable or closed or status in ("SOLD_OUT", "UNAVAILABLE", "CLOSED"):
+            return False
+        if not available:
+            return False
+        return True
+
+    if not found_any:
+        print(f"  Aug 18 not in response (only {len(items)} items returned)")
+        return None
+
+    return None
+
+# ── Playwright fallback ───────────────────────────────────────────────────────
+
+def check_via_playwright(tour: dict) -> bool | None:
+    """
+    Opens the tour page with Playwright, intercepts ALL bokun.io responses,
+    and checks availability for August 18.
+    Returns True/False/None.
     """
     url  = tour["url"]
     name = tour["name"]
 
     bokun_responses: list[dict] = []
+    discovered_channel = [None]
+    discovered_product = [None]
 
     def on_response(response):
-        """Capture all Bokun API JSON responses."""
         try:
-            if "bokun.io" in response.url and response.status == 200:
+            resp_url = response.url
+            if "bokun.io" not in resp_url:
+                return
+            # Log all bokun URLs for debugging
+            print(f"  [bokun] {response.status} {resp_url[:100]}")
+
+            # Try to extract channel/product from widget URLs like:
+            # /online-sales/{channel}/experience/{product}/...
+            if "/online-sales/" in resp_url and "/experience/" in resp_url:
+                parts = resp_url.split("/")
+                try:
+                    idx = parts.index("online-sales")
+                    discovered_channel[0] = parts[idx + 1]
+                    pidx = parts.index("experience", idx)
+                    discovered_product[0] = parts[pidx + 1].split("?")[0]
+                except (ValueError, IndexError):
+                    pass
+
+            if response.status == 200:
                 ct = response.headers.get("content-type", "")
                 if "json" in ct:
-                    bokun_responses.append({"url": response.url, "body": response.json()})
+                    body = response.json()
+                    bokun_responses.append({"url": resp_url, "body": body})
         except Exception:
             pass
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ]
+        )
         context = browser.new_context(
             user_agent=UA,
             locale="en-GB",
             viewport={"width": 1280, "height": 900},
         )
         page = context.new_page()
-
-        # Intercept Bokun API responses
         page.on("response", on_response)
 
-        # Block images/fonts to speed up load
-        page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,ico}", lambda r: r.abort())
+        # Only block images/fonts, NOT JS or XHR
+        page.route(
+            "**/*.{png,jpg,jpeg,gif,ico,woff,woff2,ttf,eot}",
+            lambda r: r.abort()
+        )
 
         print(f"  Loading {url} ...")
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.goto(url, wait_until="networkidle", timeout=60000)
         except Exception as e:
-            print(f"  Page load error: {e}")
-            browser.close()
-            return False
+            print(f"  networkidle timeout (continuing): {e}")
 
-        # Wait for Bokun widget iframe to appear and load
-        print("  Waiting for Bokun widget...")
-        try:
-            page.wait_for_selector("iframe[src*='bokun']", timeout=20000)
-        except Exception:
-            print("  Bokun iframe not found within 20s — checking what we have anyway.")
+        # Extra wait for lazy-loaded widgets
+        time.sleep(random.uniform(8, 12))
 
-        # Give the widget time to make API calls for the current month
-        time.sleep(random.uniform(5, 8))
+        # Scroll down to trigger lazy loading of booking widget
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+        time.sleep(3)
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(3)
 
-        # If we're not in August yet, try to navigate the calendar forward
-        # Look inside iframes for calendar navigation
-        try:
-            for frame in page.frames:
-                if "bokun" in frame.url:
-                    print(f"  Found Bokun iframe: {frame.url}")
-                    # Try to find and click "next month" until we reach August 2026
-                    _navigate_to_august(frame)
-                    time.sleep(3)
-                    break
-        except Exception as e:
-            print(f"  Frame navigation error: {e}")
+        # Log all frames for debug
+        for frame in page.frames:
+            if frame.url and frame.url != "about:blank":
+                print(f"  [frame] {frame.url[:100]}")
 
         browser.close()
 
-    # ── Parse captured API responses ──────────────────────────────────────────
-    return _parse_bokun_responses(bokun_responses, name)
+    # If we discovered channel/product via Playwright, try direct API
+    ch = discovered_channel[0]
+    pr = discovered_product[0]
+    if ch and pr and (ch != tour.get("bokun_channel") or pr != tour.get("bokun_product")):
+        print(f"  Discovered Bokun channel={ch} product={pr} — trying API...")
+        result = check_via_bokun_api(ch, pr, name)
+        if result is not None:
+            return result
 
+    # Parse intercepted responses
+    if not bokun_responses:
+        print(f"  No Bokun JSON responses captured.")
+        return None
 
-def _navigate_to_august(frame) -> None:
-    """Try to click 'next month' arrows in the Bokun calendar frame until August 2026."""
-    max_clicks = 14  # up to 14 months forward
-    for _ in range(max_clicks):
-        try:
-            # Check current month shown in the calendar header
-            header = frame.locator(".CalendarMonth_caption, .DayPicker-Caption, h2, .month-header").first
-            header_text = header.inner_text(timeout=2000)
-            print(f"    Calendar header: {header_text}")
-            if "August" in header_text and "2026" in header_text:
-                print("    Reached August 2026.")
-                return
-        except Exception:
-            pass
+    print(f"  Captured {len(bokun_responses)} Bokun response(s).")
+    for r in bokun_responses:
+        result = _parse_bokun_response_data(r["body"], name)
+        if result is not None:
+            return result
 
-        # Click next-month button
-        try:
-            next_btn = frame.locator(
-                "[aria-label='Next month'], [aria-label='next month'], "
-                ".DayPickerNavigation_button:last-child, "
-                ".fc-next-button, button[class*='next'], "
-                "button[class*='Next'], .navigation-next"
-            ).first
-            next_btn.click(timeout=3000)
-            time.sleep(1.2)
-        except Exception as e:
-            print(f"    Could not click next: {e}")
-            return
-
-
-def _parse_bokun_responses(responses: list[dict], tour_name: str) -> bool:
-    """
-    Parse Bokun API JSON responses to determine if August 18 is available.
-    Bokun typically returns an array of availability objects with date + available/soldOut fields.
-    """
-    if not responses:
-        print(f"  No Bokun API responses captured for {tour_name}.")
-        return False
-
-    print(f"  Captured {len(responses)} Bokun API response(s).")
-
-    for r in responses:
-        url  = r["url"]
-        body = r["body"]
-        print(f"    API: {url}")
-
-        # Bokun availability endpoint returns a list of day availability objects
-        items = body if isinstance(body, list) else body.get("items", body.get("availability", []))
-        if not isinstance(items, list):
-            continue
-
-        for item in items:
-            # Bokun date fields: "date", "startDate", "localDate"
-            date_str = (
-                item.get("date")
-                or item.get("startDate")
-                or item.get("localDate")
-                or item.get("startTime", "")
-            )
-            if not date_str:
-                continue
-
-            # Parse: "2026-08-18", "2026-08-18T00:00:00", "18.08.2026", ...
-            is_target = _is_target_date(date_str)
-            if not is_target:
-                continue
-
-            sold_out  = item.get("soldOut", False) or item.get("isSoldOut", False)
-            available = item.get("available", True)
-            unavailable = item.get("unavailable", False)
-            closed    = item.get("closed", False)
-
-            if sold_out or unavailable or closed or not available:
-                print(f"    Aug 18 → SOLD OUT / unavailable on {tour_name}")
-                return False
-            else:
-                print(f"    Aug 18 → AVAILABLE on {tour_name}!")
-                return True
-
-    print(f"  Aug 18 not found in API responses for {tour_name} — may be outside loaded months.")
-    return False
+    return None
 
 
 def _is_target_date(date_str: str) -> bool:
-    """Check if a date string refers to 2026-08-18."""
-    s = str(date_str)
-    # ISO format: 2026-08-18 or 2026-08-18T...
-    if s.startswith("2026-08-18"):
-        return True
-    # DD.MM.YYYY
-    if s.startswith("18.08.2026"):
-        return True
-    # MM/DD/YYYY
-    if s.startswith("08/18/2026"):
-        return True
-    # Epoch ms — skip (too complex without context)
+    s = date_str
+    return (
+        s.startswith("2026-08-18") or
+        s.startswith("18.08.2026") or
+        s.startswith("08/18/2026")
+    )
+
+# ── Main availability check ───────────────────────────────────────────────────
+
+def check_tour_availability(tour: dict) -> bool:
+    """
+    Try direct Bokun API first (fast), then Playwright fallback (slow).
+    Returns True if August 18 is available, False otherwise.
+    """
+    name = tour["name"]
+
+    # 1. Direct API (if we know the channel+product)
+    if tour.get("bokun_channel") and tour.get("bokun_product"):
+        result = check_via_bokun_api(tour["bokun_channel"], tour["bokun_product"], name)
+        if result is not None:
+            return result
+        print("  Direct API inconclusive — falling back to Playwright.")
+
+    # 2. Playwright
+    result = check_via_playwright(tour)
+    if result is not None:
+        return result
+
+    # 3. If still inconclusive, assume not yet available (safe default)
+    print(f"  Could not determine availability for {name} — assuming not available.")
     return False
 
 # ── WhatsApp notification ─────────────────────────────────────────────────────
@@ -296,7 +364,7 @@ def main() -> None:
                 available = True
                 print("  [SIMULATE] Forcing available=True")
             else:
-                time.sleep(random.uniform(2, 5))
+                time.sleep(random.uniform(2, 4))
                 try:
                     available = check_tour_availability(tour)
                 except Exception as e:
@@ -318,7 +386,6 @@ def main() -> None:
         state["notified"] = already_notified
         state["last_check"] = now
 
-        # Alert if too many consecutive errors
         errors = state.get("errors", 0)
         if errors > 0 and errors % 6 == 0:
             try:
