@@ -96,7 +96,7 @@ def check_liva(tour: dict) -> bool:
         available     = day.get("available", False)
         avail_slots   = day.get("availableSlots", 0)
         print(f"  Aug 18: available={available}, slots={avail_slots}")
-        return bool(available)
+        return bool(available) and avail_slots >= 2
 
     print(f"  Aug 18 not found in response.")
     return False
