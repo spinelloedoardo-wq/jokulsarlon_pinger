@@ -181,60 +181,82 @@ def send_whatsapp(message: str) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
-    now = datetime.now(timezone.utc).isoformat()
-    print(f"[{now}] Checking Jökulsárlón for {TARGET_LABEL} ({MIN_PEOPLE} people)...")
+LOOP_INTERVAL_MIN = 5   # minutes between checks
+LOOP_DURATION_MIN = 55  # total loop duration per job (stay under GitHub's 1h limit)
 
-    state = load_state()
+def run_checks(state: dict) -> dict:
+    """Run one full check cycle across all tours. Returns updated state."""
+    now = datetime.now(timezone.utc).isoformat()
+    print(f"\n[{now}] Checking Jökulsárlón for {TARGET_LABEL} ({MIN_PEOPLE} people)...")
+
     notified: list[str] = state.get("notified", [])
 
-    try:
-        for tour in TOURS:
-            name = tour["name"]
-            if name in notified:
-                print(f"\n[SKIP] {name} — already notified.")
-                continue
+    for tour in TOURS:
+        name = tour["name"]
+        if name in notified:
+            print(f"  [SKIP] {name} — already notified.")
+            continue
 
-            print(f"\n[CHECK] {name}")
-            time.sleep(random.uniform(1, 2))
+        print(f"\n  [CHECK] {name}")
+        time.sleep(random.uniform(1, 2))
 
-            try:
-                if SIMULATE:
-                    available = True
-                    print("  [SIMULATE] available=True")
-                elif tour["system"] == "liva":
-                    available = check_liva(tour)
-                else:
-                    available = check_bokun(tour)
-                state["errors"] = 0
-            except Exception as e:
-                state["errors"] = state.get("errors", 0) + 1
-                print(f"  ERROR: {e}", file=sys.stderr)
-                available = False
-
-            if available:
-                send_whatsapp(
-                    f"JOKULSARLON — {TARGET_LABEL} DISPONIBILE per {MIN_PEOPLE} persone!\n"
-                    f"Tour: {name}\n"
-                    f"Prenota subito: {tour['url']}"
-                )
-                notified.append(name)
+        try:
+            if SIMULATE:
+                available = True
+                print("  [SIMULATE] available=True")
+            elif tour["system"] == "liva":
+                available = check_liva(tour)
             else:
-                print("  Not available.")
+                available = check_bokun(tour)
+            state["errors"] = 0
+        except Exception as e:
+            state["errors"] = state.get("errors", 0) + 1
+            print(f"  ERROR: {e}", file=sys.stderr)
+            available = False
 
-        state["notified"] = notified
-        state["last_check"] = now
+        if available:
+            send_whatsapp(
+                f"JOKULSARLON — {TARGET_LABEL} DISPONIBILE per {MIN_PEOPLE} persone!\n"
+                f"Tour: {name}\n"
+                f"Prenota subito: {tour['url']}"
+            )
+            notified.append(name)
+        else:
+            print("  Not available.")
 
-        errors = state.get("errors", 0)
-        if errors > 0 and errors % 6 == 0:
-            try:
-                send_whatsapp(f"Jokulsarlon Pinger: {errors} errori consecutivi. Controlla GitHub.")
-            except Exception:
-                pass
+    state["notified"] = notified
+    state["last_check"] = now
 
-    finally:
+    errors = state.get("errors", 0)
+    if errors > 0 and errors % 6 == 0:
+        try:
+            send_whatsapp(f"Jokulsarlon Pinger: {errors} errori consecutivi. Controlla GitHub.")
+        except Exception:
+            pass
+
+    return state
+
+
+def main():
+    state = load_state()
+
+    iterations = LOOP_DURATION_MIN // LOOP_INTERVAL_MIN  # e.g. 55 // 5 = 11
+
+    for i in range(iterations):
+        if i > 0:
+            print(f"\nWaiting {LOOP_INTERVAL_MIN} min before next check...")
+            time.sleep(LOOP_INTERVAL_MIN * 60)
+
+        state = run_checks(state)
         save_state(state)
-        print("\nDone.")
+
+        # Stop early if all tours already notified
+        if len(state.get("notified", [])) == len(TOURS):
+            print("\nAll tours notified — stopping loop.")
+            break
+
+    print("\nJob complete.")
+
 
 if __name__ == "__main__":
     main()

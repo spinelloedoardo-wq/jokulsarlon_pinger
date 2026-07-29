@@ -2,8 +2,8 @@ name: Check Jökulsárlón Availability
 
 on:
   schedule:
-    # Every 5 minutes (GitHub minimum)
-    - cron: "*/5 * * * *"
+    # Once per hour — the script loops internally every 5 min for 55 min
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -12,7 +12,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 58
 
     steps:
       - name: Checkout repo (includes state.json)
