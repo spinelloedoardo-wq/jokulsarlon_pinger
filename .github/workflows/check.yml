@@ -28,8 +28,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: TEMP - Run August scan (diagnostic, reverted after use)
-        run: python scan_august.py
+      - name: Run checker
+        env:
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN:  ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM:        ${{ secrets.TWILIO_FROM }}
+          WA_TO:              ${{ secrets.WA_TO }}
+          # Uncomment to test without real Twilio creds:
+          # SIMULATE_AVAILABLE: "1"
+        run: python checker.py
 
       - name: Commit updated state.json
         run: |
