@@ -181,7 +181,7 @@ def send_whatsapp(message: str) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-LOOP_INTERVAL_MIN = 5   # minutes between checks
+LOOP_INTERVAL_MIN = 6   # minutes between checks
 LOOP_DURATION_MIN = 55  # total loop duration per job (stay under GitHub's 1h limit)
 
 def run_checks(state: dict) -> dict:
